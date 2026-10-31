@@ -1,0 +1,151 @@
+name: Windows fixture qualification
+
+on:
+  push:
+    branches:
+      - ci/2195-native-qualification-01a19147
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  qualification:
+    if: ${{ github.repository == 'Alan-TheGentleman/engram-ci-qualification-01a19147' && github.event_name == 'push' && github.ref == 'refs/heads/ci/2195-native-qualification-01a19147' }}
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: local
+      ENGRAM_TIMING_TESTS: "1"
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout control
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Checkout base
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: Gentleman-Programming/engram
+          ref: 7cf4ed29b6f99ffbebb5f74e2cf33819b24775c6
+          path: base
+          persist-credentials: false
+      - name: Checkout candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: dnlrsls/engram
+          ref: f3c247d48b217eba121bbf7e84eab132fefe13a3
+          path: candidate
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.26.10"
+          cache: false
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: "24"
+      - name: Validate prerequisites and compare both snapshots
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $root = Join-Path $env:RUNNER_TEMP "windows-fixture-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $evidence = Join-Path $root 'evidence'
+          New-Item -ItemType Directory -Force $evidence | Out-Null
+          $control = Join-Path $env:GITHUB_WORKSPACE 'control'
+          $helper = Join-Path $control '.github/scripts/windows-fixture-qualification.mjs'
+          $revisions = @{ control = $env:GITHUB_SHA; base = '7cf4ed29b6f99ffbebb5f74e2cf33819b24775c6'; candidate = 'f3c247d48b217eba121bbf7e84eab132fefe13a3' }
+          foreach ($name in @('control', 'base', 'candidate')) {
+            $actual = git -C (Join-Path $env:GITHUB_WORKSPACE $name) rev-parse HEAD
+            if ($LASTEXITCODE -ne 0 -or $actual -cne $revisions[$name]) { throw "Unexpected $name revision" }
+            "${name}_sha=$actual" | Tee-Object -FilePath "$evidence/metadata.txt" -Append
+          }
+          if ((go env GOOS) -ne 'windows' -or (go env GOARCH) -ne 'amd64' -or (go env GOHOSTOS) -ne 'windows' -or (go env GOHOSTARCH) -ne 'amd64') { throw 'Native Windows x64 required' }
+          if ((go env GOVERSION) -ne 'go1.26.10' -or (node --version) -notmatch '^v24\.') { throw 'Unexpected toolchain' }
+          if ((node -p 'process.platform + "/" + process.arch') -ne 'win32/x64') { throw 'Native Node x64 required' }
+          "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion runner=$env:RUNNER_OS/$env:RUNNER_ARCH" | Tee-Object -FilePath "$evidence/metadata.txt" -Append
+          "go=$(go version) node=$(node --version) cache=isolated-cold-no-publication" | Tee-Object -FilePath "$evidence/metadata.txt" -Append
+          Get-Command powershell.exe
+          powershell.exe -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell prerequisite failed' }
+          $gitDir = Split-Path (Get-Command git.exe).Source
+          $gitRoot = $gitDir.Replace('\', '/') -replace '/(cmd|bin|mingw64/bin|usr/bin)$', ''
+          $bash = Join-Path $gitRoot 'usr\bin\bash.exe'
+          if (!(Test-Path $bash -PathType Leaf)) { throw 'Actual Git usr/bin/bash.exe required' }
+          $bash = (Resolve-Path $bash).Path
+          if ($bash -notlike '*\usr\bin\bash.exe') { throw 'Git bin launcher is not supported' }
+          $jq = Get-Command jq.exe -CommandType Application
+          $trustedJQ = (Resolve-Path $jq.Source).Path
+          if (![IO.Path]::IsPathFullyQualified($trustedJQ) -or [IO.Path]::GetExtension($trustedJQ) -ne '.exe' -or !(Test-Path $trustedJQ -PathType Leaf)) { throw 'Absolute real jq.exe required' }
+          & $trustedJQ --version
+          if ($LASTEXITCODE -ne 0) { throw 'Trusted jq verification failed' }
+          $env:PATH = "$(Split-Path $bash);$env:PATH"
+          & $bash -lc 'set -euo pipefail; command -v bash jq curl; bash --version; jq --version; curl --version'
+          if ($LASTEXITCODE -ne 0) { throw 'Git Bash prerequisite failed' }
+          Get-Command bash, jq, curl
+          $env:CODEX_TEST_TRUSTED_BASH = $bash
+          $env:CODEX_TEST_TRUSTED_JQ = $trustedJQ
+          function Set-State($name) {
+            $state = Join-Path $root $name
+            $paths = @{ HOME = 'home'; USERPROFILE = 'home'; APPDATA = 'appdata'; LOCALAPPDATA = 'localappdata'; ENGRAM_DATA_DIR = 'data'; TEMP = 'tmp'; TMP = 'tmp'; TMPDIR = 'tmp'; GOPATH = 'gopath'; GOCACHE = 'gocache'; GOMODCACHE = 'gomodcache' }
+            foreach ($key in $paths.Keys) {
+              $value = Join-Path $state $paths[$key]
+              New-Item -ItemType Directory -Force $value | Out-Null
+              [Environment]::SetEnvironmentVariable($key, $value, 'Process')
+            }
+          }
+          $selectors = @{}
+          $listExits = @{}
+          $otherFailure = 0
+          $firstGoExit = 0
+          foreach ($name in @('base', 'candidate')) {
+            Set-State $name
+            Set-Location (Join-Path $env:GITHUB_WORKSPACE $name)
+            "${name}_go_mod_sha256=$((Get-FileHash go.mod -Algorithm SHA256).Hash)" | Tee-Object -FilePath "$evidence/metadata.txt" -Append
+            "${name}_go_sum_sha256=$((Get-FileHash go.sum -Algorithm SHA256).Hash)" | Tee-Object -FilePath "$evidence/metadata.txt" -Append
+            $selector = & node $helper selector $name
+            if ($LASTEXITCODE -ne 0) { throw 'Selector failed' }
+            $selectors[$name] = $selector
+            $prep = [Diagnostics.Stopwatch]::StartNew()
+            & go mod download 1> "$evidence/$name-download.txt" 2> "$evidence/$name-download-stderr.txt"
+            $downloadExit = $LASTEXITCODE
+            & go test -list $selector ./plugin 1> "$evidence/$name-list.txt" 2> "$evidence/$name-list-stderr.txt"
+            $listExits[$name] = $LASTEXITCODE
+            $prep.Stop()
+            @("download_exit=$downloadExit", "list_exit=$($listExits[$name])", "elapsed_seconds=$($prep.Elapsed.TotalSeconds)") | Set-Content "$evidence/$name-preparation.txt"
+            if ($otherFailure -eq 0 -and $downloadExit -ne 0) { $otherFailure = $downloadExit }
+            if ($otherFailure -eq 0 -and $listExits[$name] -ne 0) { $otherFailure = $listExits[$name] }
+          }
+          foreach ($name in @('base', 'candidate')) {
+            Set-State $name
+            Set-Location (Join-Path $env:GITHUB_WORKSPACE $name)
+            $timer = [Diagnostics.Stopwatch]::StartNew()
+            & go test -json -count=1 -timeout=10m -run $selectors[$name] ./plugin 1> "$evidence/$name-tests.json" 2> "$evidence/$name-stderr.txt"
+            $goExit = $LASTEXITCODE
+            $timer.Stop()
+            @("exit_code=$goExit", "elapsed_seconds=$($timer.Elapsed.TotalSeconds)") | Tee-Object "$evidence/$name-result.txt"
+            if ($firstGoExit -eq 0 -and $goExit -ne 0) { $firstGoExit = $goExit }
+            $payload = @{ ref = $name; exit = $goExit; listExit = $listExits[$name]; list = [IO.File]::ReadAllText("$evidence/$name-list.txt"); events = [IO.File]::ReadAllText("$evidence/$name-tests.json") } | ConvertTo-Json -Compress
+            $payload | & node $helper verify 1> "$evidence/$name-verification.txt" 2> "$evidence/$name-verification-stderr.txt"
+            $verifyExit = $LASTEXITCODE
+            Get-Content "$evidence/$name-verification.txt"
+            Get-Content "$evidence/$name-verification-stderr.txt"
+            if ($otherFailure -eq 0 -and $verifyExit -ne 0) { $otherFailure = $verifyExit }
+          }
+          $overall = if ($firstGoExit -ne 0) { $firstGoExit } else { $otherFailure }
+          exit $overall
+      - name: Preserve qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: windows-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-fixture-${{ github.run_id }}-${{ github.run_attempt }}/evidence
+          if-no-files-found: warn
